@@ -479,15 +479,18 @@ router.get("/subjects", async (req: Request, res: Response): Promise<void> => {
     const batchJson = typeof batch?.json === "string"
       ? JSON.parse(batch.json) as Record<string, unknown>
       : (batch?.json as Record<string, unknown>) ?? {};
-    const subjectIds = Array.isArray(batchJson._su) ? [...new Set(batchJson._su as string[])] : [];
-    const chapterIds = Array.isArray(batchJson._ch) ? [...new Set(batchJson._ch as string[])] : [];
-    const parentCourseIds = Array.isArray(batchJson._co) ? batchJson._co as string[] : [];
+    const subjectIds = Array.isArray(batchJson._su) ? [...new Set(batchJson._su.filter((id): id is string => typeof id === "string"))] : [];
+    const chapterIds = Array.isArray(batchJson._ch) ? [...new Set(batchJson._ch.filter((id): id is string => typeof id === "string"))] : [];
+    const parentCourseIds = Array.isArray(batchJson._co) ? batchJson._co.filter((id): id is string => typeof id === "string") : [];
     const [contentData, subjectData] = await Promise.all([
-      tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond: { "(row_id)": chapterIds } }),
-      tncProtectedRequest("fe", { json: "*" }, {
-        sch: "t_su",
-        cond: subjectIds.length ? { "(row_id)": subjectIds } : { co_refid: parentCourseIds[0] ?? "" },
-      }),
+      chapterIds.length
+        ? tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond: { "(row_id)": chapterIds } })
+        : Promise.resolve([]),
+      subjectIds.length
+        ? tncProtectedRequest("fe", { json: "*" }, { sch: "t_su", cond: { "(row_id)": subjectIds } })
+        : parentCourseIds.length
+          ? tncProtectedRequest("fe", { json: "*" }, { sch: "t_su", cond: { co_refid: parentCourseIds[0] } })
+          : Promise.resolve([]),
     ]);
     const subjects: Array<Record<string, unknown> & { rowId: string; name: string; videoCount: number; pdfCount: number; totalCount: number }> = [];
     const subjectById = new Map<string, (typeof subjects)[number]>();
@@ -658,12 +661,14 @@ router.get("/notes", async (req: Request, res: Response): Promise<void> => {
         ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
         : undefined;
       const json = typeof batch?.json === "string" ? JSON.parse(batch.json) as Record<string, unknown> : (batch?.json as Record<string, unknown>) ?? {};
-      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch : [];
+      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch.filter((id): id is string => typeof id === "string") : [];
     }
 
     const data = allParam === "true" && typeof courseId !== "string"
       ? await fetchAllChapterRows(cond)
-      : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
+      : cond["(row_id)"] && Array.isArray(cond["(row_id)"]) && (cond["(row_id)"] as string[]).length === 0
+        ? []
+        : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
 
     if (!Array.isArray(data)) {
       res.json([]);
@@ -710,13 +715,15 @@ router.get("/sessions", async (req: Request, res: Response): Promise<void> => {
         ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
         : undefined;
       const json = typeof batch?.json === "string" ? JSON.parse(batch.json) as Record<string, unknown> : (batch?.json as Record<string, unknown>) ?? {};
-      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch : [];
+      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch.filter((id): id is string => typeof id === "string") : [];
     }
     const requestedSubjectId = typeof subjectId === "string" ? subjectId.trim() : "";
 
     const data = type === "pdf" && typeof courseId !== "string"
       ? await fetchAllChapterRows(cond)
-      : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
+      : typeof courseId === "string" && Array.isArray(cond["(row_id)"]) && (cond["(row_id)"] as string[]).length === 0
+        ? []
+        : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
 
     if (!Array.isArray(data)) {
       res.json(courseId ? [] : { sessions: [], total: 0 });
