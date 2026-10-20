@@ -11,9 +11,10 @@ const router = Router();
 const CRM_BASE = "https://crm.tncnursing.in";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? "";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? "";
-const CRM_CHAPTER_PAGE_SIZE = 500;
-const CRM_CHAPTER_PAGE_CONCURRENCY = 2;
-const CRM_CHAPTER_MAX_PAGES = 200;
+const CRM_PAGE_SIZE = 500;
+const CRM_PAGE_CONCURRENCY = 2;
+const CRM_MAX_PAGES = 200;
+const CRM_ID_BATCH_SIZE = 250;
 const PROMO_EXPIRES_DAYS = 30;
 
 function requireAdmin(req: Request, res: Response): boolean {
@@ -340,34 +341,73 @@ function parseChapter(row: Record<string, unknown>) {
   };
 }
 
-async function fetchAllChapterRows(cond: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+async function fetchAllTncRows(
+  se: string,
+  data: Record<string, unknown> = { json: "*" },
+  extra: Record<string, unknown> = {},
+): Promise<Record<string, unknown>[]> {
   const rows: Record<string, unknown>[] = [];
-  const fetchPage = (page: number) => tncProtectedRequest("fe", { json: "*" }, {
-    sch: "t_ch",
-    cond,
+  const fetchPage = (page: number) => tncProtectedRequest(se, data, {
+    ...extra,
     page,
-    limit: CRM_CHAPTER_PAGE_SIZE,
+    limit: CRM_PAGE_SIZE,
   });
 
   const firstPage = await fetchPage(1);
-  if (!Array.isArray(firstPage)) throw new Error("CRM chapter list response was not an array");
+  if (!Array.isArray(firstPage)) throw new Error("CRM list response was not an array");
   rows.push(...firstPage as Record<string, unknown>[]);
-  if (firstPage.length < CRM_CHAPTER_PAGE_SIZE) return rows;
+  if (firstPage.length < CRM_PAGE_SIZE) return rows;
 
-  for (let pageStart = 2; pageStart <= CRM_CHAPTER_MAX_PAGES; pageStart += CRM_CHAPTER_PAGE_CONCURRENCY) {
+  for (let pageStart = 2; pageStart <= CRM_MAX_PAGES; pageStart += CRM_PAGE_CONCURRENCY) {
     const pageNumbers = Array.from(
-      { length: Math.min(CRM_CHAPTER_PAGE_CONCURRENCY, CRM_CHAPTER_MAX_PAGES - pageStart + 1) },
+      { length: Math.min(CRM_PAGE_CONCURRENCY, CRM_MAX_PAGES - pageStart + 1) },
       (_, index) => pageStart + index,
     );
     const pages = await Promise.all(pageNumbers.map(fetchPage));
     for (const result of pages) {
-      if (!Array.isArray(result)) throw new Error("CRM chapter list response was not an array");
+      if (!Array.isArray(result)) throw new Error("CRM list response was not an array");
       rows.push(...result as Record<string, unknown>[]);
-      if (result.length < CRM_CHAPTER_PAGE_SIZE) return rows;
+      if (result.length < CRM_PAGE_SIZE) return rows;
     }
   }
 
-  throw new Error(`CRM chapter list exceeded ${CRM_CHAPTER_MAX_PAGES * CRM_CHAPTER_PAGE_SIZE} rows`);
+  throw new Error(`CRM list exceeded ${CRM_MAX_PAGES * CRM_PAGE_SIZE} rows`);
+}
+
+async function fetchRowsByIds(sch: string, rowIds: string[]): Promise<Record<string, unknown>[]> {
+  const uniqueIds = [...new Set(rowIds.filter((rowId) => typeof rowId === "string" && rowId.length > 0))];
+  const rows: Record<string, unknown>[] = [];
+  for (let offset = 0; offset < uniqueIds.length; offset += CRM_ID_BATCH_SIZE) {
+    const ids = uniqueIds.slice(offset, offset + CRM_ID_BATCH_SIZE);
+    const result = await tncProtectedRequest("fe", { json: "*" }, { sch, cond: { "(row_id)": ids } });
+    if (!Array.isArray(result)) throw new Error(`CRM ${sch} ID response was not an array`);
+    rows.push(...result as Record<string, unknown>[]);
+  }
+  return rows;
+}
+
+async function fetchRelatedTncRows(sch: string, courseIds: string[], rowIds: string[]): Promise<Record<string, unknown>[]> {
+  const rowsById = new Map<string, Record<string, unknown>>();
+  const relations = [...new Set(courseIds.filter((id) => typeof id === "string" && id.length > 0))];
+  const relatedRowSets = await Promise.all(relations.map((courseId) =>
+    fetchAllTncRows("fe", { json: "*" }, { sch, cond: { co_refid: courseId } }),
+  ));
+  for (const rows of relatedRowSets) {
+    for (const row of rows) {
+      const rowId = String(row.row_id ?? "");
+      if (rowId) rowsById.set(rowId, row);
+    }
+  }
+
+  const missingIds = rowIds.filter((rowId) => !rowsById.has(rowId));
+  if (missingIds.length > 0) {
+    const missingRows = await fetchRowsByIds(sch, missingIds);
+    for (const row of missingRows) {
+      const rowId = String(row.row_id ?? "");
+      if (rowId) rowsById.set(rowId, row);
+    }
+  }
+  return [...rowsById.values()];
 }
 
 function parseSlider(row: Record<string, unknown>) {
@@ -450,7 +490,7 @@ function parseQuestion(row: Record<string, unknown>) {
 // GET /api/courses — newest first
 router.get("/courses", async (_req: Request, res: Response): Promise<void> => {
   try {
-    const data = await tncProtectedRequest("fe_co");
+    const data = await fetchAllTncRows("fe_co", {});
     const courses = Array.isArray(data)
       ? (data as Record<string, unknown>[]).map(parseCourse)
       : [];
@@ -472,7 +512,7 @@ router.get("/courses", async (_req: Request, res: Response): Promise<void> => {
 router.get("/subjects", async (req: Request, res: Response): Promise<void> => {
   try {
     const { courseId } = req.query;
-    const batches = await tncProtectedRequest("fe_co");
+    const batches = await fetchAllTncRows("fe_co", {});
     const batch = Array.isArray(batches)
       ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
       : undefined;
@@ -482,15 +522,10 @@ router.get("/subjects", async (req: Request, res: Response): Promise<void> => {
     const subjectIds = Array.isArray(batchJson._su) ? [...new Set(batchJson._su.filter((id): id is string => typeof id === "string"))] : [];
     const chapterIds = Array.isArray(batchJson._ch) ? [...new Set(batchJson._ch.filter((id): id is string => typeof id === "string"))] : [];
     const parentCourseIds = Array.isArray(batchJson._co) ? batchJson._co.filter((id): id is string => typeof id === "string") : [];
+    const relatedCourseIds = [...new Set([...(typeof courseId === "string" ? [courseId] : []), ...parentCourseIds])];
     const [contentData, subjectData] = await Promise.all([
-      chapterIds.length
-        ? tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond: { "(row_id)": chapterIds } })
-        : Promise.resolve([]),
-      subjectIds.length
-        ? tncProtectedRequest("fe", { json: "*" }, { sch: "t_su", cond: { "(row_id)": subjectIds } })
-        : parentCourseIds.length
-          ? tncProtectedRequest("fe", { json: "*" }, { sch: "t_su", cond: { co_refid: parentCourseIds[0] } })
-          : Promise.resolve([]),
+      fetchRelatedTncRows("t_ch", relatedCourseIds, chapterIds),
+      fetchRelatedTncRows("t_su", relatedCourseIds, subjectIds),
     ]);
     const subjects: Array<Record<string, unknown> & { rowId: string; name: string; videoCount: number; pdfCount: number; totalCount: number }> = [];
     const subjectById = new Map<string, (typeof subjects)[number]>();
@@ -655,19 +690,22 @@ router.get("/notes", async (req: Request, res: Response): Promise<void> => {
   try {
     const { courseId, limit: limitParam, all: allParam } = req.query;
     const cond: Record<string, unknown> = {};
+    let courseIds: string[] = [];
+    let chapterIds: string[] = [];
     if (typeof courseId === "string") {
-      const batches = await tncProtectedRequest("fe_co");
+      const batches = await fetchAllTncRows("fe_co", {});
       const batch = Array.isArray(batches)
         ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
         : undefined;
       const json = typeof batch?.json === "string" ? JSON.parse(batch.json) as Record<string, unknown> : (batch?.json as Record<string, unknown>) ?? {};
-      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch.filter((id): id is string => typeof id === "string") : [];
+      courseIds = [...new Set([courseId, ...(Array.isArray(json._co) ? json._co.filter((id): id is string => typeof id === "string") : [])])];
+      chapterIds = Array.isArray(json._ch) ? [...new Set(json._ch.filter((id): id is string => typeof id === "string"))] : [];
     }
 
-    const data = allParam === "true" && typeof courseId !== "string"
-      ? await fetchAllChapterRows(cond)
-      : cond["(row_id)"] && Array.isArray(cond["(row_id)"]) && (cond["(row_id)"] as string[]).length === 0
-        ? []
+    const data = typeof courseId === "string"
+      ? await fetchRelatedTncRows("t_ch", courseIds, chapterIds)
+      : allParam === "true"
+        ? await fetchAllTncRows("fe", { json: "*" }, { sch: "t_ch", cond })
         : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
 
     if (!Array.isArray(data)) {
@@ -709,20 +747,23 @@ router.get("/sessions", async (req: Request, res: Response): Promise<void> => {
   try {
     const { courseId, subjectId, limit: limitParam, type, sort, page: pageParam, search } = req.query;
     const cond: Record<string, unknown> = {};
+    let courseIds: string[] = [];
+    let chapterIds: string[] = [];
     if (typeof courseId === "string") {
-      const batches = await tncProtectedRequest("fe_co");
+      const batches = await fetchAllTncRows("fe_co", {});
       const batch = Array.isArray(batches)
         ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
         : undefined;
       const json = typeof batch?.json === "string" ? JSON.parse(batch.json) as Record<string, unknown> : (batch?.json as Record<string, unknown>) ?? {};
-      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch.filter((id): id is string => typeof id === "string") : [];
+      courseIds = [...new Set([courseId, ...(Array.isArray(json._co) ? json._co.filter((id): id is string => typeof id === "string") : [])])];
+      chapterIds = Array.isArray(json._ch) ? [...new Set(json._ch.filter((id): id is string => typeof id === "string"))] : [];
     }
     const requestedSubjectId = typeof subjectId === "string" ? subjectId.trim() : "";
 
-    const data = type === "pdf" && typeof courseId !== "string"
-      ? await fetchAllChapterRows(cond)
-      : typeof courseId === "string" && Array.isArray(cond["(row_id)"]) && (cond["(row_id)"] as string[]).length === 0
-        ? []
+    const data = typeof courseId === "string"
+      ? await fetchRelatedTncRows("t_ch", courseIds, chapterIds)
+      : type === "pdf"
+        ? await fetchAllTncRows("fe", { json: "*" }, { sch: "t_ch", cond })
         : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
 
     if (!Array.isArray(data)) {
