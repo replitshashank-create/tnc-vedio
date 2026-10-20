@@ -12,7 +12,7 @@ const CRM_BASE = "https://crm.tncnursing.in";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? "";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? "";
 const CRM_CHAPTER_PAGE_SIZE = 500;
-const CRM_CHAPTER_PAGE_CONCURRENCY = 8;
+const CRM_CHAPTER_PAGE_CONCURRENCY = 2;
 const CRM_CHAPTER_MAX_PAGES = 200;
 const PROMO_EXPIRES_DAYS = 30;
 
@@ -342,18 +342,24 @@ function parseChapter(row: Record<string, unknown>) {
 
 async function fetchAllChapterRows(cond: Record<string, unknown>): Promise<Record<string, unknown>[]> {
   const rows: Record<string, unknown>[] = [];
+  const fetchPage = (page: number) => tncProtectedRequest("fe", { json: "*" }, {
+    sch: "t_ch",
+    cond,
+    page,
+    limit: CRM_CHAPTER_PAGE_SIZE,
+  });
 
-  for (let firstPage = 1; firstPage <= CRM_CHAPTER_MAX_PAGES; firstPage += CRM_CHAPTER_PAGE_CONCURRENCY) {
-    const pages = await Promise.all(Array.from({ length: CRM_CHAPTER_PAGE_CONCURRENCY }, (_, index) => {
-      const page = firstPage + index;
-      return tncProtectedRequest("fe", { json: "*" }, {
-        sch: "t_ch",
-        cond,
-        page,
-        limit: CRM_CHAPTER_PAGE_SIZE,
-      });
-    }));
+  const firstPage = await fetchPage(1);
+  if (!Array.isArray(firstPage)) throw new Error("CRM chapter list response was not an array");
+  rows.push(...firstPage as Record<string, unknown>[]);
+  if (firstPage.length < CRM_CHAPTER_PAGE_SIZE) return rows;
 
+  for (let pageStart = 2; pageStart <= CRM_CHAPTER_MAX_PAGES; pageStart += CRM_CHAPTER_PAGE_CONCURRENCY) {
+    const pageNumbers = Array.from(
+      { length: Math.min(CRM_CHAPTER_PAGE_CONCURRENCY, CRM_CHAPTER_MAX_PAGES - pageStart + 1) },
+      (_, index) => pageStart + index,
+    );
+    const pages = await Promise.all(pageNumbers.map(fetchPage));
     for (const result of pages) {
       if (!Array.isArray(result)) throw new Error("CRM chapter list response was not an array");
       rows.push(...result as Record<string, unknown>[]);
@@ -365,20 +371,25 @@ async function fetchAllChapterRows(cond: Record<string, unknown>): Promise<Recor
 }
 
 async function fetchCourseChapterRows(courseIds: string[], chapterIds: string[]): Promise<Record<string, unknown>[]> {
-  const conditions: Record<string, unknown>[] = [
-    ...(chapterIds.length ? [{ "(row_id)": chapterIds }] : []),
-    ...courseIds.map((courseId) => ({ co_refid: courseId })),
-  ];
-  if (conditions.length === 0) return [];
-
-  const resultSets = await Promise.all(conditions.map(fetchAllChapterRows));
   const uniqueRows = new Map<string, Record<string, unknown>>();
+  const courseConditions = [...new Set(courseIds)].map((courseId) => ({ co_refid: courseId }));
+  const resultSets = await Promise.all(courseConditions.map(fetchAllChapterRows));
   for (const rows of resultSets) {
     for (const row of rows) {
       const rowId = String(row.row_id ?? "");
       if (rowId) uniqueRows.set(rowId, row);
     }
   }
+
+  const missingChapterIds = chapterIds.filter((chapterId) => !uniqueRows.has(chapterId));
+  if (missingChapterIds.length > 0) {
+    const missingRows = await fetchAllChapterRows({ "(row_id)": missingChapterIds });
+    for (const row of missingRows) {
+      const rowId = String(row.row_id ?? "");
+      if (rowId) uniqueRows.set(rowId, row);
+    }
+  }
+
   return [...uniqueRows.values()];
 }
 
