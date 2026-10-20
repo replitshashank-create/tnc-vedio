@@ -370,29 +370,6 @@ async function fetchAllChapterRows(cond: Record<string, unknown>): Promise<Recor
   throw new Error(`CRM chapter list exceeded ${CRM_CHAPTER_MAX_PAGES * CRM_CHAPTER_PAGE_SIZE} rows`);
 }
 
-async function fetchCourseChapterRows(courseIds: string[], chapterIds: string[]): Promise<Record<string, unknown>[]> {
-  const uniqueRows = new Map<string, Record<string, unknown>>();
-  const courseConditions = [...new Set(courseIds)].map((courseId) => ({ co_refid: courseId }));
-  const resultSets = await Promise.all(courseConditions.map(fetchAllChapterRows));
-  for (const rows of resultSets) {
-    for (const row of rows) {
-      const rowId = String(row.row_id ?? "");
-      if (rowId) uniqueRows.set(rowId, row);
-    }
-  }
-
-  const missingChapterIds = chapterIds.filter((chapterId) => !uniqueRows.has(chapterId));
-  if (missingChapterIds.length > 0) {
-    const missingRows = await fetchAllChapterRows({ "(row_id)": missingChapterIds });
-    for (const row of missingRows) {
-      const rowId = String(row.row_id ?? "");
-      if (rowId) uniqueRows.set(rowId, row);
-    }
-  }
-
-  return [...uniqueRows.values()];
-}
-
 function parseSlider(row: Record<string, unknown>) {
   const json = (row.json as Record<string, unknown>) ?? {};
   const at = (json._at as Record<string, unknown>) ?? {};
@@ -505,12 +482,8 @@ router.get("/subjects", async (req: Request, res: Response): Promise<void> => {
     const subjectIds = Array.isArray(batchJson._su) ? [...new Set(batchJson._su as string[])] : [];
     const chapterIds = Array.isArray(batchJson._ch) ? [...new Set(batchJson._ch as string[])] : [];
     const parentCourseIds = Array.isArray(batchJson._co) ? batchJson._co as string[] : [];
-    const contentDataPromise = fetchCourseChapterRows(
-      [...new Set([...(typeof courseId === "string" ? [courseId] : []), ...parentCourseIds])],
-      chapterIds,
-    );
     const [contentData, subjectData] = await Promise.all([
-      contentDataPromise,
+      tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond: { "(row_id)": chapterIds } }),
       tncProtectedRequest("fe", { json: "*" }, {
         sch: "t_su",
         cond: subjectIds.length ? { "(row_id)": subjectIds } : { co_refid: parentCourseIds[0] ?? "" },
@@ -679,23 +652,18 @@ router.get("/notes", async (req: Request, res: Response): Promise<void> => {
   try {
     const { courseId, limit: limitParam, all: allParam } = req.query;
     const cond: Record<string, unknown> = {};
-    let courseChapterIds: string[] = [];
-    let courseRelationIds: string[] = [];
     if (typeof courseId === "string") {
       const batches = await tncProtectedRequest("fe_co");
       const batch = Array.isArray(batches)
         ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
         : undefined;
       const json = typeof batch?.json === "string" ? JSON.parse(batch.json) as Record<string, unknown> : (batch?.json as Record<string, unknown>) ?? {};
-      courseChapterIds = Array.isArray(json._ch) ? json._ch.filter((id): id is string => typeof id === "string") : [];
-      courseRelationIds = Array.isArray(json._co) ? json._co.filter((id): id is string => typeof id === "string") : [];
+      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch : [];
     }
 
-    const data = typeof courseId === "string"
-      ? await fetchCourseChapterRows([...new Set([courseId, ...courseRelationIds])], courseChapterIds)
-      : allParam === "true"
-        ? await fetchAllChapterRows(cond)
-        : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
+    const data = allParam === "true" && typeof courseId !== "string"
+      ? await fetchAllChapterRows(cond)
+      : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
 
     if (!Array.isArray(data)) {
       res.json([]);
@@ -736,24 +704,19 @@ router.get("/sessions", async (req: Request, res: Response): Promise<void> => {
   try {
     const { courseId, subjectId, limit: limitParam, type, sort, page: pageParam, search } = req.query;
     const cond: Record<string, unknown> = {};
-    let courseChapterIds: string[] = [];
-    let courseRelationIds: string[] = [];
     if (typeof courseId === "string") {
       const batches = await tncProtectedRequest("fe_co");
       const batch = Array.isArray(batches)
         ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
         : undefined;
       const json = typeof batch?.json === "string" ? JSON.parse(batch.json) as Record<string, unknown> : (batch?.json as Record<string, unknown>) ?? {};
-      courseChapterIds = Array.isArray(json._ch) ? json._ch.filter((id): id is string => typeof id === "string") : [];
-      courseRelationIds = Array.isArray(json._co) ? json._co.filter((id): id is string => typeof id === "string") : [];
+      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch : [];
     }
     const requestedSubjectId = typeof subjectId === "string" ? subjectId.trim() : "";
 
-    const data = typeof courseId === "string"
-      ? await fetchCourseChapterRows([...new Set([courseId, ...courseRelationIds])], courseChapterIds)
-      : type === "pdf"
-        ? await fetchAllChapterRows(cond)
-        : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
+    const data = type === "pdf" && typeof courseId !== "string"
+      ? await fetchAllChapterRows(cond)
+      : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
 
     if (!Array.isArray(data)) {
       res.json(courseId ? [] : { sessions: [], total: 0 });
