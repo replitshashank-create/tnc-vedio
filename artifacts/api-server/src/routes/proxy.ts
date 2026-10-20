@@ -118,7 +118,7 @@ function deriveSubject(title: string): { rowId: string; name: string } {
   return { rowId: "uncategorized", name: "Uncategorized" };
 }
 
-function isYouTubeUrl(url: unknown): url is string {
+function isYouTubeUrl(url: unknown): boolean {
   if (typeof url !== "string" || !url.startsWith("http")) return false;
   return url.includes("youtube.com") || url.includes("youtu.be");
 }
@@ -129,9 +129,8 @@ function isPdfCandidate(url: unknown): boolean {
   if (!value) return false;
   if (isYouTubeUrl(value)) return false;
   if (/\.(mp4|m3u8|webm|mov|avi|mkv)(\?|$)/i.test(value)) return false;
+  if (/\.pdf(?:[?#]|$)/i.test(value)) return true;
   if (/youtube|vimeo|bunny|video|stream|cloudfront|cdn/i.test(value)) return false;
-  // More permissive PDF detection
-  if (/\.pdf(\?|$)/i.test(value)) return true;
   if (value.includes("/pdf/") || value.includes("application/pdf")) return true;
   // Also accept common document paths
   if (value.includes("/uploads/") && (value.includes(".pdf") || value.includes("document") || value.includes("note"))) return true;
@@ -618,7 +617,7 @@ router.get("/media-proxy", async (req: Request, res: Response): Promise<void> =>
 // GET /api/notes — PDF-only sessions per course (or newest 60 across all courses)
 router.get("/notes", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { courseId, limit: limitParam } = req.query;
+    const { courseId, limit: limitParam, all: allParam } = req.query;
     const cond: Record<string, unknown> = {};
     if (typeof courseId === "string") {
       const batches = await tncProtectedRequest("fe_co");
@@ -650,7 +649,13 @@ router.get("/notes", async (req: Request, res: Response): Promise<void> => {
       return String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? ""));
     });
 
-    const limit = courseId ? sessions.length : Math.min(parseInt(String(limitParam ?? "60")), 200);
+    if (courseId || allParam === "true") {
+      res.json(sessions);
+      return;
+    }
+
+    const requestedLimit = Number.parseInt(String(limitParam ?? "60"), 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 0), 200) : 60;
     res.json(sessions.slice(0, limit));
   } catch (err) {
     if (sendTncLoginRequired(res, err)) return;
