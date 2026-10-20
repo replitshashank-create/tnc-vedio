@@ -11,6 +11,9 @@ const router = Router();
 const CRM_BASE = "https://crm.tncnursing.in";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? "";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? "";
+const CRM_CHAPTER_PAGE_SIZE = 500;
+const CRM_CHAPTER_PAGE_CONCURRENCY = 8;
+const CRM_CHAPTER_MAX_PAGES = 200;
 const PROMO_EXPIRES_DAYS = 30;
 
 function requireAdmin(req: Request, res: Response): boolean {
@@ -337,6 +340,48 @@ function parseChapter(row: Record<string, unknown>) {
   };
 }
 
+async function fetchAllChapterRows(cond: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+  const rows: Record<string, unknown>[] = [];
+
+  for (let firstPage = 1; firstPage <= CRM_CHAPTER_MAX_PAGES; firstPage += CRM_CHAPTER_PAGE_CONCURRENCY) {
+    const pages = await Promise.all(Array.from({ length: CRM_CHAPTER_PAGE_CONCURRENCY }, (_, index) => {
+      const page = firstPage + index;
+      return tncProtectedRequest("fe", { json: "*" }, {
+        sch: "t_ch",
+        cond,
+        page,
+        limit: CRM_CHAPTER_PAGE_SIZE,
+      });
+    }));
+
+    for (const result of pages) {
+      if (!Array.isArray(result)) throw new Error("CRM chapter list response was not an array");
+      rows.push(...result as Record<string, unknown>[]);
+      if (result.length < CRM_CHAPTER_PAGE_SIZE) return rows;
+    }
+  }
+
+  throw new Error(`CRM chapter list exceeded ${CRM_CHAPTER_MAX_PAGES * CRM_CHAPTER_PAGE_SIZE} rows`);
+}
+
+async function fetchCourseChapterRows(courseIds: string[], chapterIds: string[]): Promise<Record<string, unknown>[]> {
+  const conditions: Record<string, unknown>[] = [
+    ...(chapterIds.length ? [{ "(row_id)": chapterIds }] : []),
+    ...courseIds.map((courseId) => ({ co_refid: courseId })),
+  ];
+  if (conditions.length === 0) return [];
+
+  const resultSets = await Promise.all(conditions.map(fetchAllChapterRows));
+  const uniqueRows = new Map<string, Record<string, unknown>>();
+  for (const rows of resultSets) {
+    for (const row of rows) {
+      const rowId = String(row.row_id ?? "");
+      if (rowId) uniqueRows.set(rowId, row);
+    }
+  }
+  return [...uniqueRows.values()];
+}
+
 function parseSlider(row: Record<string, unknown>) {
   const json = (row.json as Record<string, unknown>) ?? {};
   const at = (json._at as Record<string, unknown>) ?? {};
@@ -449,8 +494,12 @@ router.get("/subjects", async (req: Request, res: Response): Promise<void> => {
     const subjectIds = Array.isArray(batchJson._su) ? [...new Set(batchJson._su as string[])] : [];
     const chapterIds = Array.isArray(batchJson._ch) ? [...new Set(batchJson._ch as string[])] : [];
     const parentCourseIds = Array.isArray(batchJson._co) ? batchJson._co as string[] : [];
+    const contentDataPromise = fetchCourseChapterRows(
+      [...new Set([...(typeof courseId === "string" ? [courseId] : []), ...parentCourseIds])],
+      chapterIds,
+    );
     const [contentData, subjectData] = await Promise.all([
-      tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond: { "(row_id)": chapterIds } }),
+      contentDataPromise,
       tncProtectedRequest("fe", { json: "*" }, {
         sch: "t_su",
         cond: subjectIds.length ? { "(row_id)": subjectIds } : { co_refid: parentCourseIds[0] ?? "" },
@@ -614,21 +663,28 @@ router.get("/media-proxy", async (req: Request, res: Response): Promise<void> =>
   }
 });
 
-// GET /api/notes — PDF-only sessions per course (or newest 60 across all courses)
+// GET /api/notes — PDF-only sessions; all=true returns every paginated CRM result
 router.get("/notes", async (req: Request, res: Response): Promise<void> => {
   try {
     const { courseId, limit: limitParam, all: allParam } = req.query;
     const cond: Record<string, unknown> = {};
+    let courseChapterIds: string[] = [];
+    let courseRelationIds: string[] = [];
     if (typeof courseId === "string") {
       const batches = await tncProtectedRequest("fe_co");
       const batch = Array.isArray(batches)
         ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
         : undefined;
       const json = typeof batch?.json === "string" ? JSON.parse(batch.json) as Record<string, unknown> : (batch?.json as Record<string, unknown>) ?? {};
-      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch : [];
+      courseChapterIds = Array.isArray(json._ch) ? json._ch.filter((id): id is string => typeof id === "string") : [];
+      courseRelationIds = Array.isArray(json._co) ? json._co.filter((id): id is string => typeof id === "string") : [];
     }
 
-    const data = await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
+    const data = typeof courseId === "string"
+      ? await fetchCourseChapterRows([...new Set([courseId, ...courseRelationIds])], courseChapterIds)
+      : allParam === "true"
+        ? await fetchAllChapterRows(cond)
+        : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
 
     if (!Array.isArray(data)) {
       res.json([]);
@@ -669,17 +725,24 @@ router.get("/sessions", async (req: Request, res: Response): Promise<void> => {
   try {
     const { courseId, subjectId, limit: limitParam, type, sort, page: pageParam, search } = req.query;
     const cond: Record<string, unknown> = {};
+    let courseChapterIds: string[] = [];
+    let courseRelationIds: string[] = [];
     if (typeof courseId === "string") {
       const batches = await tncProtectedRequest("fe_co");
       const batch = Array.isArray(batches)
         ? (batches as Record<string, unknown>[]).find((row) => row.row_id === courseId)
         : undefined;
       const json = typeof batch?.json === "string" ? JSON.parse(batch.json) as Record<string, unknown> : (batch?.json as Record<string, unknown>) ?? {};
-      cond["(row_id)"] = Array.isArray(json._ch) ? json._ch : [];
+      courseChapterIds = Array.isArray(json._ch) ? json._ch.filter((id): id is string => typeof id === "string") : [];
+      courseRelationIds = Array.isArray(json._co) ? json._co.filter((id): id is string => typeof id === "string") : [];
     }
     const requestedSubjectId = typeof subjectId === "string" ? subjectId.trim() : "";
 
-    const data = await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
+    const data = typeof courseId === "string"
+      ? await fetchCourseChapterRows([...new Set([courseId, ...courseRelationIds])], courseChapterIds)
+      : type === "pdf"
+        ? await fetchAllChapterRows(cond)
+        : await tncProtectedRequest("fe", { json: "*" }, { sch: "t_ch", cond });
 
     if (!Array.isArray(data)) {
       res.json(courseId ? [] : { sessions: [], total: 0 });

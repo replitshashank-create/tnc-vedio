@@ -140,7 +140,7 @@ All paths in this table are prefixed by `/api`; append them to
 | `GET /sessions?courseId={courseRowId}&subjectId={subjectRowId}&type=pdf` | PDF sessions. Mixed PDF/video rows may also appear here. |
 | `GET /sessions?courseId={courseRowId}&subjectId={subjectRowId}&search={text}` | Subject lessons filtered by title. Also supports `sort=newest`. |
 | `GET /sessions/{sessionRowId}` | One session. A missing ID returns `404`. |
-| `GET /notes?courseId={courseRowId}` | Course PDFs sorted in lesson order. Without course ID, defaults to the newest 60, maximum 200. |
+| `GET /notes?courseId={courseRowId}` | Course PDFs sorted in lesson order. Without course ID, defaults to the newest 60, maximum 200. Add `all=true` to retrieve all PDFs across courses. |
 | `GET /sliders` | Homepage banners: `id`, `rowId`, `imageUrl`, `name`, `description`. |
 | `GET /promo/status` | `{ enabled, expiresAt, message }`; used by the UI's promo access display. |
 | `GET /purchases/{userId}` | Purchase rows for the supplied user ID. |
